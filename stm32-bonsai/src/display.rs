@@ -56,27 +56,27 @@ where
     RST: OutputPin,
     CS: OutputPin,
 {
-    const CMD_SWRESET: u8 = 0x01;
-    const CMD_SLPOUT: u8 = 0x11;
-    const CMD_DISPON: u8 = 0x29;
-    const CMD_NORON: u8 = 0x13;
-    const CMD_MADCTL: u8 = 0x36;
-    const CMD_COLMOD: u8 = 0x3A;
-    const CMD_CASET: u8 = 0x2A;
-    const CMD_RASET: u8 = 0x2B;
-    const CMD_RAMWR: u8 = 0x2C;
-    const CMD_INVCTR: u8 = 0xB4;
-    const CMD_PWCTR1: u8 = 0xC0;
-    const CMD_PWCTR2: u8 = 0xC1;
-    const CMD_PWCTR3: u8 = 0xC2;
-    const CMD_PWCTR4: u8 = 0xC3;
-    const CMD_PWCTR5: u8 = 0xC4;
-    const CMD_VMCTR1: u8 = 0xC5;
-    const CMD_FRMCTR1: u8 = 0xB1;
-    const CMD_FRMCTR2: u8 = 0xB2;
-    const CMD_FRMCTR3: u8 = 0xB3;
-    const CMD_GMCTRP1: u8 = 0xE0;
-    const CMD_GMCTRN1: u8 = 0xE1;
+    const CMD_SWRESET: u8 = 0x01; // 软件复位（Software Reset）
+    const CMD_SLPOUT: u8 = 0x11;  // 退出休眠（Sleep Out）
+    const CMD_DISPON: u8 = 0x29;  // 开启显示（Display ON）
+    const CMD_NORON: u8 = 0x13;   // 正常显示模式（Normal Display Mode ON）
+    const CMD_MADCTL: u8 = 0x36;  // 内存数据访问控制（Memory Access Control）
+    const CMD_COLMOD: u8 = 0x3A;  // 像素格式/色彩模式（Interface Pixel Format）
+    const CMD_CASET: u8 = 0x2A;   // 列地址设置（Column Address Set）
+    const CMD_RASET: u8 = 0x2B;   // 行地址设置（Row/Row Address Set）
+    const CMD_RAMWR: u8 = 0x2C;   // 显存写入（Memory Write）
+    const CMD_INVCTR: u8 = 0xB4;  // 反显控制（Display Inversion Control）
+    const CMD_PWCTR1: u8 = 0xC0;  // 供电控制1（Power Control 1）
+    const CMD_PWCTR2: u8 = 0xC1;  // 供电控制2（Power Control 2）
+    const CMD_PWCTR3: u8 = 0xC2;  // 供电控制3（Power Control 3）
+    const CMD_PWCTR4: u8 = 0xC3;  // 供电控制4（Power Control 4）
+    const CMD_PWCTR5: u8 = 0xC4;  // 供电控制5（Power Control 5）
+    const CMD_VMCTR1: u8 = 0xC5;  // VCOM 电压控制1（VCOM Control 1）
+    const CMD_FRMCTR1: u8 = 0xB1; // 帧率控制1（Frame Rate Control 1）
+    const CMD_FRMCTR2: u8 = 0xB2; // 帧率控制2（Frame Rate Control 2）
+    const CMD_FRMCTR3: u8 = 0xB3; // 帧率控制3（Frame Rate Control 3）
+    const CMD_GMCTRP1: u8 = 0xE0; // 正极性伽马表（Gamma Correction Positive Polarity）
+    const CMD_GMCTRN1: u8 = 0xE1; // 负极性伽马表（Gamma Correction Negative Polarity）
 
     pub fn new(spi: SPI, dc: DC, rst: RST, cs: CS) -> Self {
         Self {
@@ -219,6 +219,7 @@ where
         Ok(())
     }
 
+    /// 绘制固定的标题栏（项目名），并设置背景色
     fn draw_header(&mut self) -> Result<(), SPI::Error> {
         let header_bg = Rgb565::GREEN;
         let header_fg = Rgb565::BLACK;
@@ -226,6 +227,7 @@ where
         self.draw_text_scaled(6, 4, "Bonsai Monitor", header_fg, header_bg, 1)
     }
 
+    /// 在整行区域绘制给定文本（自动清背景），并支持缩放
     fn draw_line(
         &mut self,
         y: u16,
@@ -241,6 +243,7 @@ where
         self.draw_text_scaled(6, y + 2, text, fg, bg, scale)
     }
 
+    /// 以 8x8 点阵字体绘制字符串，按 `scale` 等比缩放
     fn draw_text_scaled(
         &mut self,
         mut x: u16,
@@ -265,6 +268,7 @@ where
         Ok(())
     }
 
+    /// 绘制单个等宽字符的点阵到指定窗口
     fn draw_char(
         &mut self,
         x: u16,
@@ -307,6 +311,7 @@ where
         Ok(())
     }
 
+    /// 用指定颜色填充矩形区域
     fn fill_rect(
         &mut self,
         x: u16,
@@ -339,10 +344,12 @@ where
         Ok(())
     }
 
+    /// 清空屏幕为指定颜色
     fn clear(&mut self, color: Rgb565) -> Result<(), SPI::Error> {
         self.fill_rect(0, 0, self.width, self.height, color)
     }
 
+    /// 设置后续写入的地址窗口（列/行起止）
     fn set_window(&mut self, x0: u16, y0: u16, x1: u16, y1: u16) -> Result<(), SPI::Error> {
         let xs = (x0 + self.x_offset, x1 + self.x_offset);
         let ys = (y0 + self.y_offset, y1 + self.y_offset);
@@ -367,6 +374,7 @@ where
         self.command(Self::CMD_RAMWR, &[])
     }
 
+    /// 发送命令并可选跟随数据（DC=0 为命令、DC=1 为数据）
     fn command(&mut self, cmd: u8, data: &[u8]) -> Result<(), SPI::Error> {
         self.cs.set_low().ok();
         self.dc.set_low().ok();
@@ -379,6 +387,7 @@ where
         Ok(())
     }
 
+    /// 仅写入数据字节到显存（用于填充或字符绘制）
     fn write_data(&mut self, data: &[u8]) -> Result<(), SPI::Error> {
         if data.is_empty() {
             return Ok(());

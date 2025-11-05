@@ -123,6 +123,7 @@ fn write_option_u16<const N: usize>(buf: &mut String<N>, value: Option<u16>) -> 
     }
 }
 
+/// 逐字节发送一行 NDJSON（末尾自动添加换行并刷新）
 fn transmit_line(tx: &mut Tx<USART1>, payload: &[u8]) {
     for byte in payload {
         let _ = block!(tx.write_u8(*byte));
@@ -131,6 +132,7 @@ fn transmit_line(tx: &mut Tx<USART1>, payload: &[u8]) {
     let _ = block!(tx.flush());
 }
 
+/// 将布尔值映射为 0/1 标志，便于压缩报文体积
 const fn bool_to_flag(value: bool) -> u8 {
     if value {
         1

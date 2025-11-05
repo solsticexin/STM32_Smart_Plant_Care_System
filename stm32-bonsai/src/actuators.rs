@@ -109,6 +109,11 @@ pub fn handle_buzzer_command(
     }
 }
 
+/// 通用布尔开关动作应用函数
+///
+/// - `on`：将目标标志位置为 `true`
+/// - `off`：将目标标志位置为 `false`
+/// - 其它动作返回错误（如 `pulse` 由上层单独实现）
 fn apply_binary_action(flag: &mut bool, action: &str) -> CommandOutcome {
     match action {
         "on" => {

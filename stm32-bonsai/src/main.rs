@@ -2,17 +2,26 @@
 #![no_main]
 #![no_std]
 
-// 将 panic 输出到调试串口
+//! 智能盆栽系统固件（STM32F103）
+//!
+//! - 传感器：DHT11（温湿度）、土壤湿度（ADC）、BH1750（光照）
+//! - 执行器：水泵、补光灯、风扇、蜂鸣器
+//! - 显示：ST7735 TFT（SPI）用于展示当前环境数据
+//! - 通信：USART1 与外部主机（如 ESP）使用 NDJSON 交互命令/数据
+//! - 调度：基于 RTIC 的任务与资源管理，TIM2 周期触发遥测与脉冲计时
+
+// 将 panic 输出到调试串口，便于调试
 use panic_probe as _;
 
 // 模块化拆分：执行器控制逻辑、通信协议与传感器采集
-mod actuators;
-mod display;
-mod protocol;
-mod sensors;
+mod actuators;  // 执行器控制模块，负责管理水泵、补光灯、风扇和蜂鸣器等设备
+mod display;   // 显示模块，负责ST7735显示屏的驱动和数据渲染
+mod protocol;  // 通信协议模块，负责解析JSON命令和生成响应报文
+mod sensors;   // 传感器模块，负责采集温湿度、光照和土壤湿度等环境数据
 
 #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true)]
 mod app {
+    // RTIC 应用模块：定义共享/本地资源、初始化与中断任务
     use cortex_m::{asm, delay::Delay};
     use heapless::String;
     use stm32f1xx_hal::{
@@ -42,92 +51,101 @@ mod app {
     };
 
     /// 共享资源：串口发送端、执行器状态以及蜂鸣器控制
-    type LightI2c = I2c<pac::I2C1>;
-    type DisplaySpi = Spi<pac::SPI1, u8, Floating>;
-    type DisplayDriver = St7735Display<
-        DisplaySpi,
-        PA4<Output<PushPull>>,
-        PA2<Output<PushPull>>,
-        PA3<Output<PushPull>>,
+    type LightI2c = I2c<pac::I2C1>;  // 用于BH1750光照传感器的I2C接口
+    type DisplaySpi = Spi<pac::SPI1, u8, Floating>;  // 用于ST7735显示屏的SPI接口
+    type DisplayDriver = St7735Display<  // ST7735显示屏驱动器类型定义
+        DisplaySpi,      // SPI接口
+        PA4<Output<PushPull>>,  // 数据/命令控制引脚(DC)
+        PA2<Output<PushPull>>,  // 复位引脚(RST)
+        PA3<Output<PushPull>>,  // 片选引脚(CS)
     >;
 
     #[shared]
     struct Shared {
-        tx: Tx<USART1>,
-        actuators: ActuatorState,
-        environment: Environment,
-        buzzer_pin: PA1<Output<PushPull>>,
-        buzzer_pulse_ms: Option<u32>,
-        water_pin: PB0<Output<PushPull>>,
-        light_pin: PB1<Output<PushPull>>,
-        fan_pin: PB10<Output<PushPull>>,
-        water_pulse_ms: Option<u32>,
-        light_pulse_ms: Option<u32>,
-        fan_pulse_ms: Option<u32>,
+        tx: Tx<USART1>,  // 串口发送端，用于向ESP发送数据
+        actuators: ActuatorState,  // 执行器状态，记录各设备开关状态
+        environment: Environment,  // 环境数据，包含温湿度、土壤湿度和光照强度
+        buzzer_pin: PA1<Output<PushPull>>,  // 蜂鸣器控制引脚
+        buzzer_pulse_ms: Option<u32>,  // 蜂鸣器脉冲剩余时间(毫秒)
+        water_pin: PB0<Output<PushPull>>,  // 水泵控制引脚
+        light_pin: PB1<Output<PushPull>>,  // 补光灯控制引脚
+        fan_pin: PB10<Output<PushPull>>,  // 风扇控制引脚
+        water_pulse_ms: Option<u32>,  // 水泵脉冲剩余时间(毫秒)
+        light_pulse_ms: Option<u32>,  // 补光灯脉冲剩余时间(毫秒)
+        fan_pulse_ms: Option<u32>,  // 风扇脉冲剩余时间(毫秒)
     }
 
     /// 本地资源：串口接收端、接收缓冲以及定时器
     #[local]
     struct Local {
-        rx: Rx<USART1>,
-        line_buf: String<LINE_BUFFER_CAPACITY>,
-        telemetry_timer: CounterHz<pac::TIM2>,
-        telemetry_ticks: u32,
-        dht11: Dht11,
-        delay: Delay,
-        adc: Adc<pac::ADC1>,
-        soil_pin: PA0<Analog>,
-        i2c: LightI2c,
-        display: DisplayDriver,
+        rx: Rx<USART1>,  // 串口接收端，用于接收来自ESP的命令
+        line_buf: String<LINE_BUFFER_CAPACITY>,  // 串口接收缓冲区，用于缓存命令行
+        telemetry_timer: CounterHz<pac::TIM2>,  // 遥测定时器，用于周期性上报数据
+        telemetry_ticks: u32,  // 遥测计时器计数
+        dht11: Dht11,  // DHT11温湿度传感器实例
+        delay: Delay,  // 延时器，用于精确延时控制
+        adc: Adc<pac::ADC1>,  // ADC模块，用于读取模拟量传感器
+        soil_pin: PA0<Analog>,  // 土壤湿度传感器模拟输入引脚
+        i2c: LightI2c,  // I2C接口，用于与BH1750光照传感器通信
+        display: DisplayDriver,  // 显示屏驱动器，用于显示环境数据
     }
 
     /// 系统初始化：配置时钟、外设与定时器
     #[init]
     fn init(ctx: init::Context) -> (Shared, Local, init::Monotonics) {
         // 配置外部 8MHz 晶振，并将系统时钟提升到 72MHz
+        // 这是STM32F103系列芯片的最高稳定频率
         let mut flash = ctx.device.FLASH.constrain();
         let mut rcc = ctx
             .device
             .RCC
             .freeze(
-                RccConfig::hse(8.MHz())
-                    .sysclk(72.MHz())
-                    .pclk1(36.MHz())
-                    .pclk2(72.MHz()),
+                RccConfig::hse(8.MHz())  // 外部高速晶振8MHz
+                    .sysclk(72.MHz())    // 系统时钟72MHz
+                    .pclk1(36.MHz())     // APB1总线时钟36MHz
+                    .pclk2(72.MHz()),    // APB2总线时钟72MHz
                 &mut flash.acr,
             );
 
         // 拆分 GPIO 寄存器，准备配置所需引脚
+        // GPIOA和GPIOB端口将被用于连接传感器和执行器
         let mut gpioa = ctx.device.GPIOA.split(&mut rcc);
         let gpiob = ctx.device.GPIOB.split(&mut rcc);
-        let mut gpiob_crl = gpiob.crl;
-        let mut gpiob_crh = gpiob.crh;
+        let mut gpiob_crl = gpiob.crl;  // GPIOB低8位配置寄存器
+        let mut gpiob_crh = gpiob.crh;  // GPIOB高8位配置寄存器
 
         // 执行器输出引脚，其中蜂鸣器为低电平触发，因此默认拉高关闭
+        // 水泵控制引脚(PB0)，高电平触发，默认低电平关闭
         let mut water_pin = gpiob.pb0.into_push_pull_output(&mut gpiob_crl);
         water_pin.set_low();
+        // 补光灯控制引脚(PB1)，高电平触发，默认低电平关闭
         let mut light_pin = gpiob.pb1.into_push_pull_output(&mut gpiob_crl);
         light_pin.set_low();
+        // 风扇控制引脚(PB10)，高电平触发，默认低电平关闭
         let mut fan_pin = gpiob.pb10.into_push_pull_output(&mut gpiob_crh);
         fan_pin.set_low();
+        // 蜂鸣器控制引脚(PA1)，低电平触发，默认高电平关闭
         let mut buzzer_pin = gpioa.pa1.into_push_pull_output(&mut gpioa.crl);
         buzzer_pin.set_high();
 
-        // 传感器相关引脚保持占位状态，后续接入真实驱动
-        let soil_pin = gpioa.pa0.into_analog(&mut gpioa.crl);
-        let dht_pin = gpiob.pb5.into_floating_input(&mut gpiob_crl);
-        let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob_crl);
-        let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob_crl);
-        let dht11 = Dht11::new(dht_pin, gpiob_crl);
+        // 传感器相关引脚配置
+        let soil_pin = gpioa.pa0.into_analog(&mut gpioa.crl);  // 土壤湿度传感器模拟输入
+        let dht_pin = gpiob.pb5.into_floating_input(&mut gpiob_crl);  // DHT11数据引脚
+        // I2C引脚配置，用于BH1750光照传感器
+        let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob_crl);  // I2C时钟线
+        let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob_crl);  // I2C数据线
+        let dht11 = Dht11::new(dht_pin, gpiob_crl);  // 初始化DHT11传感器
+        // 初始化I2C总线，标准模式100kHz
         let mut i2c = I2c::new(
             ctx.device.I2C1,
             (scl, sda),
             Mode::standard(100.kHz()),
             &mut rcc,
         );
-        let _ = Bh1750::init(&mut i2c);
+        let _ = Bh1750::init(&mut i2c);  // 初始化BH1750光照传感器
 
-        // USART1：PA9 / PA10 作为 TX / RX
+        // USART1串口配置：PA9作为TX，PA10作为RX
+        // 波特率115200，用于与ESP模块通信
         let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
         let rx_pin = gpioa.pa10;
         let mut serial = Serial::new(
@@ -136,27 +154,30 @@ mod app {
             SerialConfig::default().baudrate(115_200.bps()),
             &mut rcc,
         );
-        serial.listen(SerialEvent::Rxne);
-        let (tx, rx) = serial.split();
+        serial.listen(SerialEvent::Rxne);  // 启用接收中断
+        let (tx, rx) = serial.split();  // 分离发送和接收端
 
-        // TIM2 作为 1kHz 基准计时器，用于遥测与蜂鸣器脉冲计时
+        // TIM2定时器配置：1kHz基准计时器
+        // 用于遥测数据周期性发送和蜂鸣器脉冲计时
         let mut telemetry_timer = Timer::new(ctx.device.TIM2, &mut rcc).counter_hz();
-       telemetry_timer.listen(TimerEvent::Update);
-       let _ = telemetry_timer.start(1_000.Hz());
+       telemetry_timer.listen(TimerEvent::Update);  // 启用更新中断
+       let _ = telemetry_timer.start(1_000.Hz());  // 1ms触发一次中断
 
-        // 创建基于 SYST 的延迟，用于 DHT11 微秒级时序及显示屏初始化
+        // 创建基于SYST的延迟，用于DHT11微秒级时序及显示屏初始化
         let mut delay = Delay::new(ctx.core.SYST, rcc.clocks.sysclk().raw());
 
-        // SPI 显示屏：ST7735
-        let sck = gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl);
-        let miso = gpioa.pa6.into_floating_input(&mut gpioa.crl);
-        let mosi = gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl);
-        let mut dc = gpioa.pa4.into_push_pull_output(&mut gpioa.crl);
-        let mut rst = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
-        let mut cs = gpioa.pa3.into_push_pull_output(&mut gpioa.crl);
+        // SPI显示屏配置：ST7735 TFT显示屏
+        let sck = gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl);  // SPI时钟线
+        let miso = gpioa.pa6.into_floating_input(&mut gpioa.crl);      // SPI主入从出线
+        let mosi = gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl); // SPI主出从入线
+        let mut dc = gpioa.pa4.into_push_pull_output(&mut gpioa.crl);   // 数据/命令控制引脚
+        let mut rst = gpioa.pa2.into_push_pull_output(&mut gpioa.crl); // 复位引脚
+        let mut cs = gpioa.pa3.into_push_pull_output(&mut gpioa.crl);  // 片选引脚
+        // 初始化引脚状态：片选高(未选中)，复位高(不复位)，DC高(数据模式)
         cs.set_high();
         rst.set_high();
         dc.set_high();
+        // 配置SPI模式：CPOL=0，CPHA=0，8MHz时钟
         let spi_mode = SpiMode {
             polarity: Polarity::IdleLow,
             phase: Phase::CaptureOnFirstTransition,
@@ -166,8 +187,8 @@ mod app {
             .SPI1
             .spi((Some(sck), Some(miso), Some(mosi)), spi_mode, 8.MHz(), &mut rcc);
         let mut display = St7735Display::new(spi, dc, rst, cs);
-        let _ = display.init(&mut delay);
-        let _ = display.render_environment(&Environment::default());
+        let _ = display.init(&mut delay);  // 初始化显示屏
+        let _ = display.render_environment(&Environment::default());  // 显示默认环境数据
 
         let adc = Adc::new(ctx.device.ADC1, &mut rcc);
 
