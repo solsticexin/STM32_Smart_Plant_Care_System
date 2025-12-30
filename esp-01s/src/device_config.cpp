@@ -4,7 +4,7 @@
 namespace device_config {
 
 // Configure the credentials for the access point hosted by the ESP module.
-const char WIFI_SSID[] = "ESP01S-Garden";
-const char WIFI_PASSWORD[] = "esp8266ap";
+const char WIFI_SSID[] = "智能盆栽养护检测系统";
+const char WIFI_PASSWORD[] = "12345678";
 
 }  // namespace device_config

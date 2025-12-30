@@ -1,19 +1,36 @@
-// 原理说明：串口桥接模块负责缓存并转发 STM32 与 ESP-01S 之间的 NDJSON 行消息，统一管理收发流程，降低主循环负担。
+// 串口通信模块
+// 负责处理与STM32的串口通信，实现协议帧的收发
 #pragma once
 
 #include <Arduino.h>
-#include <ArduinoJson.h>
-#include <IPAddress.h>
+#include <functional>
+#include <vector>
+#include "protocol_parser.h"
 
 namespace serial_bridge {
 
-using MessageHandler = void (*)(const String& json_line);
+// 消息处理回调类型
+typedef std::function<void(ProtocolFrame*)> FrameHandler;
 
+// 初始化串口通信
 void begin(HardwareSerial& serial_port, unsigned long baud_rate);
+
+// 主循环处理
 void loop();
-void setMessageHandler(MessageHandler handler);
-bool sendJson(const JsonDocument& doc);
-bool sendRawLine(const String& line);
-bool sendStatusMessage(const IPAddress& ip);
+
+// 设置帧处理回调
+void setFrameHandler(FrameHandler handler);
+
+// 发送协议帧
+bool sendFrame(const ProtocolFrame& frame);
+
+// 直接发送原始数据
+bool sendRaw(const uint8_t* data, size_t length);
+
+// 发送控制命令
+bool sendCommand(ActuatorTag tag, ActuatorState state);
+
+// 发送脉冲控制命令
+bool sendPulseCommand(ActuatorTag tag, uint16_t duration_ms);
 
 }  // namespace serial_bridge

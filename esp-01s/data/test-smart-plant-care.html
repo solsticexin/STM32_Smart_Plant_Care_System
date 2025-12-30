@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>智能植物护理系统 - 功能测试</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      background-color: #f5f5f5;
+    }
+    .test-container {
+      max-width: 800px;
+      margin: 0 auto;
+      background-color: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+      text-align: center;
+    }
+    .test-section {
+      margin: 20px 0;
+      padding: 15px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    h2 {
+      color: #555;
+      margin-top: 0;
+    }
+    .test-result {
+      margin: 10px 0;
+      padding: 10px;
+      border-radius: 4px;
+    }
+    .pass {
+      background-color: #d4edda;
+      color: #155724;
+      border: 1px solid #c3e6cb;
+    }
+    .fail {
+      background-color: #f8d7da;
+      color: #721c24;
+      border: 1px solid #f5c6cb;
+    }
+    .test-details {
+      margin: 10px 0;
+      padding: 10px;
+      background-color: #f8f9fa;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 14px;
+      overflow-x: auto;
+    }
+    button {
+      background-color: #007bff;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    .stats {
+      display: flex;
+      justify-content: space-around;
+      margin: 20px 0;
+      font-size: 18px;
+      font-weight: bold;
+    }
+    .pass-count {
+      color: #155724;
+    }
+    .fail-count {
+      color: #721c24;
+    }
+  </style>
+</head>
+<body>
+  <div class="test-container">
+    <h1>智能植物护理系统 - 功能测试</h1>
+    
+    <div class="stats">
+      <div class="pass-count">通过: <span id="pass-count">0</span></div>
+      <div class="fail-count">失败: <span id="fail-count">0</span></div>
+      <div class="total-count">总数: <span id="total-count">0</span></div>
+    </div>
+    
+    <button onclick="runAllTests()">运行所有测试</button>
+    
+    <div id="test-results"></div>
+  </div>
+
+  <!-- 引入测试框架和核心模块 -->
+  <script type="module">
+    // 导入核心模块
+    import { ProtocolParser, MESSAGE_TYPES, SENSOR_TAGS, ACTUATOR_TAGS, ACTUATOR_STATES } from './protocol-parser.js';
+    import { StateManager } from './state-manager.js';
+    import { CommunicationManager } from './communication-manager.js';
+    
+    // 测试框架
+    class TestRunner {
+      constructor() {
+        this.results = [];
+        this.testResultsDiv = document.getElementById('test-results');
+        this.passCountEl = document.getElementById('pass-count');
+        this.failCountEl = document.getElementById('fail-count');
+        this.totalCountEl = document.getElementById('total-count');
+      }
+      
+      assertEqual(actual, expected, message) {
+        if (actual !== expected) {
+          throw new Error(`${message}: 预期 ${expected}，实际 ${actual}`);
+        }
+      }
+      
+      assertDeepEqual(actual, expected, message) {
+        if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+          throw new Error(`${message}: 预期 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`);
+        }
+      }
+      
+      assertTrue(actual, message) {
+        if (!actual) {
+          throw new Error(`${message}: 预期为true，实际为 ${actual}`);
+        }
+      }
+      
+      assertFalse(actual, message) {
+        if (actual) {
+          throw new Error(`${message}: 预期为false，实际为 ${actual}`);
+        }
+      }
+      
+      assertNotNull(value, message) {
+        if (value === null || value === undefined) {
+          throw new Error(message);
+        }
+      }
+      
+      run() {
+        this.testResultsDiv.innerHTML = '';
+        
+        // 协议解析器测试
+        this.runProtocolParserTests();
+        
+        // 状态管理器测试
+        this.runStateManagerTests();
+        
+        // 通信管理器测试
+        this.runCommunicationManagerTests();
+        
+        // 更新统计信息
+        this.updateStats();
+      }
+      
+      runProtocolParserTests() {
+        const section = document.createElement('div');
+        section.className = 'test-section';
+        section.innerHTML = '<h2>1. 协议解析器测试</h2>';
+        this.testResultsDiv.appendChild(section);
+        
+        // CRC计算测试
+        try {
+          const data = new Uint8Array([0xAA, 0x02, 0x01, 0x02, 0x01, 0x01]);
+          const crc = ProtocolParser.calculateCRC(data);
+          this.assertEqual(crc, 0xAA ^ 0x02 ^ 0x01 ^ 0x02 ^ 0x01 ^ 0x01, 'CRC计算错误');
+          this.addTestResult(section, 'CRC计算测试', true);
+        } catch (error) {
+          this.addTestResult(section, 'CRC计算测试', false, error.message);
+        }
+        
+        // TLV解析测试
+        try {
+          const tlvData = new Uint8Array([0x02, 0x02, 0x09, 0xC4]); // 温度25.00°C
+          const parsed = ProtocolParser.parseTLV(tlvData);
+          this.assertEqual(parsed[0x02], 2500, 'TLV解析错误');
+          this.addTestResult(section, 'TLV解析测试', true);
+        } catch (error) {
+          this.addTestResult(section, 'TLV解析测试', false, error.message);
+        }
+        
+        // TLV构建测试
+        try {
+          const tlvData = { [0x02]: 2500 };
+          const built = ProtocolParser.buildTLV(tlvData);
+          this.assertDeepEqual(built, [0x02, 0x02, 0x09, 0xC4], 'TLV构建错误');
+          this.addTestResult(section, 'TLV构建测试', true);
+        } catch (error) {
+          this.addTestResult(section, 'TLV构建测试', false, error.message);
+        }
+        
+        // 帧构建测试
+        try {
+          const tlvData = { [0x02]: 2500 };
+          const frame = ProtocolParser.buildFrame(0x01, tlvData);
+          this.assertEqual(frame[0], 0xAA, '帧起始标志错误');
+          this.assertEqual(frame[1], 4, '帧长度错误');
+          this.assertEqual(frame[2], 0x01, '消息类型错误');
+          this.addTestResult(section, '帧构建测试', true);
+        } catch (error) {
+          this.addTestResult(section, '帧构建测试', false, error.message);
+        }
+        
+        // 帧解析测试
+        try {
+          // 模拟传感器上报帧：温度25.00°C
+          const rawFrame = new Uint8Array([0xAA, 0x05, 0x01, 0x02, 0x02, 0x09, 0xC4, 0xAA ^ 0x05 ^ 0x01 ^ 0x02 ^ 0x02 ^ 0x09 ^ 0xC4]);
+          const parsed = ProtocolParser.parseFrame(rawFrame);
+          this.assertNotNull(parsed, '帧解析失败');
+          this.assertEqual(parsed.type, 0x01, '消息类型解析错误');
+          this.assertEqual(parsed.payload[0x02], 2500, '传感器数据解析错误');
+          this.addTestResult(section, '帧解析测试', true);
+        } catch (error) {
+          this.addTestResult(section, '帧解析测试', false, error.message);
+        }
+      }
+      
+      runStateManagerTests() {
+        const section = document.createElement('div');
+        section.className = 'test-section';
+        section.innerHTML = '<h2>2. 状态管理器测试</h2>';
+        this.testResultsDiv.appendChild(section);
+        
+        // 传感器数据更新测试
+        try {
+          const stateManager = new StateManager();
+          const testData = {
+            [SENSOR_TAGS.TEMPERATURE]: 2500, // 温度25.00°C
+            [SENSOR_TAGS.HUMIDITY]: 5000  // 湿度50.00%
+          };
+          
+          stateManager.updateSensorData(testData);
+          const state = stateManager.getState();
+          this.assertEqual(state.sensorData.temperature, 25.0, '温度数据更新错误');
+          this.assertEqual(state.sensorData.humidity, 50.0, '湿度数据更新错误');
+          this.addTestResult(section, '传感器数据更新测试', true);
+        } catch (error) {
+          this.addTestResult(section, '传感器数据更新测试', false, error.message);
+        }
+        
+        // 执行器状态更新测试
+        try {
+          const stateManager = new StateManager();
+          const testData = {
+            [ACTUATOR_TAGS.FAN]: ACTUATOR_STATES.ON // 风扇开启
+          };
+          
+          stateManager.updateActuatorStatus(testData);
+          const state = stateManager.getState();
+          this.assertEqual(state.actuatorStatus.fan, ACTUATOR_STATES.ON, '执行器状态更新错误');
+          this.addTestResult(section, '执行器状态更新测试', true);
+        } catch (error) {
+          this.addTestResult(section, '执行器状态更新测试', false, error.message);
+        }
+        
+        // 命令确认更新测试
+        try {
+          const stateManager = new StateManager();
+          const testData = {
+            [ACTUATOR_TAGS.FAN]: ACTUATOR_STATES.ON // 风扇命令确认成功
+          };
+          
+          stateManager.updateCommandAck(testData);
+          const state = stateManager.getState();
+          this.assertEqual(state.latestAck.result, 'ok', '命令确认更新错误');
+          this.assertEqual(state.latestAck.target, 'fan', '命令目标映射错误');
+          this.addTestResult(section, '命令确认更新测试', true);
+        } catch (error) {
+          this.addTestResult(section, '命令确认更新测试', false, error.message);
+        }
+        
+        // 阈值更新测试
+        try {
+          const stateManager = new StateManager();
+          const thresholds = {
+            temp: 30,
+            humi: 70
+          };
+          
+          stateManager.updateThresholds(thresholds);
+          const state = stateManager.getState();
+          this.assertEqual(state.thresholds.temp, 30, '温度阈值更新错误');
+          this.assertEqual(state.thresholds.humi, 70, '湿度阈值更新错误');
+          this.addTestResult(section, '阈值更新测试', true);
+        } catch (error) {
+          this.addTestResult(section, '阈值更新测试', false, error.message);
+        }
+      }
+      
+      runCommunicationManagerTests() {
+        const section = document.createElement('div');
+        section.className = 'test-section';
+        section.innerHTML = '<h2>3. 通信管理器测试</h2>';
+        this.testResultsDiv.appendChild(section);
+        
+        // 命令发送测试
+        try {
+          const stateManager = new StateManager();
+          const commManager = new CommunicationManager(stateManager);
+          
+          let commandSent = false;
+          // 重写sendCommand方法以捕获发送的命令
+          const originalSend = commManager.sendCommand;
+          commManager.sendCommand = function(target, action, time) {
+            commandSent = true;
+            return originalSend.call(this, target, action, time);
+          };
+          
+          commManager.sendCommand('fan', 'on');
+          this.assertTrue(commandSent, '命令发送失败');
+          this.addTestResult(section, '命令发送测试', true);
+        } catch (error) {
+          this.addTestResult(section, '命令发送测试', false, error.message);
+        }
+        
+        // 脉冲命令发送测试
+        try {
+          const stateManager = new StateManager();
+          const commManager = new CommunicationManager(stateManager);
+          
+          let commandSent = false;
+          const originalSend = commManager.sendCommand;
+          commManager.sendCommand = function(target, action, time) {
+            if (action === 'pulse' && time === 2000) {
+              commandSent = true;
+            }
+            return originalSend.call(this, target, action, time);
+          };
+          
+          commManager.sendCommand('buzzer', 'pulse', 2000);
+          this.assertTrue(commandSent, '脉冲命令发送失败');
+          this.addTestResult(section, '脉冲命令发送测试', true);
+        } catch (error) {
+          this.addTestResult(section, '脉冲命令发送测试', false, error.message);
+        }
+      }
+      
+      addTestResult(section, testName, passed, errorMsg = '') {
+        const resultDiv = document.createElement('div');
+        resultDiv.className = `test-result ${passed ? 'pass' : 'fail'}`;
+        resultDiv.innerHTML = `
+          <strong>${testName}</strong>: ${passed ? '通过' : '失败'}
+          ${errorMsg ? `<div class="test-details">${errorMsg}</div>` : ''}
+        `;
+        section.appendChild(resultDiv);
+        
+        this.results.push({ name: testName, passed });
+      }
+      
+      updateStats() {
+        const passCount = this.results.filter(r => r.passed).length;
+        const failCount = this.results.filter(r => !r.passed).length;
+        const totalCount = this.results.length;
+        
+        this.passCountEl.textContent = passCount;
+        this.failCountEl.textContent = failCount;
+        this.totalCountEl.textContent = totalCount;
+      }
+    }
+    
+    // 全局测试运行函数
+    window.runAllTests = function() {
+      const runner = new TestRunner();
+      runner.run();
+    };
+    
+    // 自动运行测试
+    window.onload = function() {
+      runAllTests();
+    };
+  </script>
+</body>
+</html>

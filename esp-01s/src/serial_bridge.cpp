@@ -1,35 +1,60 @@
-// 原理说明：本文件实现串口行缓冲与 JSON 打包发送，以最小内存代价可靠转发 NDJSON 通信内容。
+// 串口通信模块实现
+// 负责处理与STM32的串口通信，实现协议帧的收发
 #include "serial_bridge.h"
 
 #include <HardwareSerial.h>
 
+using namespace std;
+
 namespace serial_bridge {
 namespace {
 
-HardwareSerial* port = nullptr;
-MessageHandler message_handler = nullptr;
-String rx_buffer;
+HardwareSerial *port = nullptr;
+FrameHandler frame_handler = nullptr;
+std::vector<uint8_t> rx_buffer;
+constexpr size_t MAX_BUFFER_SIZE = 1024;
 
-void dispatchBuffer() {
-  if (rx_buffer.length() == 0) {
+void processReceivedData() {
+  if (rx_buffer.empty()) {
     return;
   }
-  if (message_handler != nullptr) {
-    message_handler(rx_buffer);
+
+  size_t consumed = 0;
+  while (rx_buffer.size() > 0) {
+    ProtocolFrame *frame = ProtocolParser::parseFrame(
+        rx_buffer.data(), rx_buffer.size(), consumed);
+    if (frame != nullptr) {
+      // 处理完整帧
+      if (frame_handler != nullptr) {
+        frame_handler(frame);
+      }
+      delete frame;
+      // 移除已处理的数据
+      rx_buffer.erase(rx_buffer.begin(), rx_buffer.begin() + consumed);
+    } else {
+      // 没有完整帧或解析失败
+      if (consumed > 0) {
+        // 移除无效数据
+        rx_buffer.erase(rx_buffer.begin(), rx_buffer.begin() + consumed);
+      } else {
+        // 没有足够数据，等待更多数据
+        break;
+      }
+    }
   }
-  rx_buffer = "";
+
+  // 限制缓冲区大小，防止内存溢出
+  if (rx_buffer.size() > MAX_BUFFER_SIZE) {
+    rx_buffer.clear();
+  }
 }
 
-}  // namespace
+} // namespace
 
-void begin(HardwareSerial& serial_port, unsigned long baud_rate) {
+void begin(HardwareSerial &serial_port, unsigned long baud_rate) {
   port = &serial_port;
   port->begin(baud_rate);
   rx_buffer.reserve(256);
-}
-
-void setMessageHandler(MessageHandler handler) {
-  message_handler = handler;
 }
 
 void loop() {
@@ -37,54 +62,89 @@ void loop() {
     return;
   }
 
+  // 读取串口数据
   while (port->available() > 0) {
-    const char ch = static_cast<char>(port->read());
-    if (ch == '\n') {
-      dispatchBuffer();
-    } else if (ch == '\r') {
-      continue;
-    } else {
-      if (rx_buffer.length() < 512) {
-        rx_buffer += ch;
-      } else {
-        // 缓冲区溢出时丢弃当前行，避免占用过多内存。
-        rx_buffer = "";
-      }
-    }
+    uint8_t byte = port->read();
+    rx_buffer.push_back(byte);
   }
+
+  // 处理接收到的数据
+  processReceivedData();
 }
 
-bool sendJson(const JsonDocument& doc) {
+void setFrameHandler(FrameHandler handler) { frame_handler = handler; }
+
+bool sendFrame(const ProtocolFrame &frame) {
   if (port == nullptr) {
     return false;
   }
-  const size_t written = serializeJson(doc, *port);
-  if (written == 0) {
+
+  // 构建帧数据
+  std::vector<TLV> payload(frame.payload.begin(), frame.payload.end());
+  std::vector<uint8_t> frame_data =
+      ProtocolParser::buildFrame(frame.type, payload);
+
+  // 发送帧数据
+  size_t written = port->write(frame_data.data(), frame_data.size());
+  if (written != frame_data.size()) {
     return false;
   }
-  port->write('\n');
   port->flush();
   return true;
 }
 
-bool sendRawLine(const String& line) {
+bool sendRaw(const uint8_t *data, size_t length) {
   if (port == nullptr) {
     return false;
   }
-  if (line.length() == 0) {
+
+  size_t written = port->write(data, length);
+  if (written != length) {
     return false;
   }
-  port->print(line);
-  port->write('\n');
   port->flush();
   return true;
 }
 
-bool sendStatusMessage(const IPAddress& ip) {
-  StaticJsonDocument<96> doc;
-  doc["type"] = "status";
-  doc["ip"] = ip.toString();
-  return sendJson(doc);
+bool sendCommand(ActuatorTag tag, ActuatorState state) {
+  if (port == nullptr) {
+    return false;
+  }
+
+  // 构建命令帧
+  TLV tlv = ProtocolParser::buildTLV(static_cast<uint8_t>(tag),
+                                     static_cast<uint8_t>(state));
+  std::vector<TLV> payload = {tlv};
+  std::vector<uint8_t> frame_data =
+      ProtocolParser::buildFrame(MessageType::COMMAND, payload);
+
+  // 发送命令帧
+  size_t written = port->write(frame_data.data(), frame_data.size());
+  if (written != frame_data.size()) {
+    return false;
+  }
+  port->flush();
+  return true;
 }
 
-}  // namespace serial_bridge
+bool sendPulseCommand(ActuatorTag tag, uint16_t duration_ms) {
+  if (port == nullptr) {
+    return false;
+  }
+
+  // 构建脉冲命令帧
+  TLV tlv = ProtocolParser::buildTLV(static_cast<uint8_t>(tag), duration_ms);
+  std::vector<TLV> payload = {tlv};
+  std::vector<uint8_t> frame_data =
+      ProtocolParser::buildFrame(MessageType::COMMAND, payload);
+
+  // 发送命令帧
+  size_t written = port->write(frame_data.data(), frame_data.size());
+  if (written != frame_data.size()) {
+    return false;
+  }
+  port->flush();
+  return true;
+}
+
+} // namespace serial_bridge

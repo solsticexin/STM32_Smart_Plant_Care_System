@@ -1,4 +1,5 @@
-// 原理说明：主程序负责初始化各模块、周期性维护 Wi-Fi 与串口通信状态，并驱动 Web 服务器与协议中转逻辑。
+// 原理说明：主程序负责初始化各模块、周期性维护 Wi-Fi 与串口通信状态，并驱动 Web
+// 服务器与协议中转逻辑。
 #include <Arduino.h>
 
 #include "device_config.h"
@@ -29,16 +30,17 @@ void reportNetworkStatusIfChanged() {
   }
 }
 
-}  // namespace
+} // namespace
 
 void setup() {
   serial_bridge::begin(Serial, device_config::STM32_SERIAL_BAUD);
   // Serial.println();
   // Serial.println(F("智能盆栽通信终端启动中..."));
 
-  serial_bridge::setMessageHandler(web_server_module::handleSerialLine);
+  // serial_bridge::setMessageHandler已被setFrameHandler替代，现在在web_server_module::start中设置
 
-  wifi_manager::startAccessPoint(device_config::WIFI_SSID, device_config::WIFI_PASSWORD);
+  wifi_manager::startAccessPoint(device_config::WIFI_SSID,
+                                 device_config::WIFI_PASSWORD);
   if (wifi_manager::isConnected()) {
     // Serial.print(F("Wi-Fi 热点已创建，SSID: "));
     // Serial.println(device_config::WIFI_SSID);
@@ -63,7 +65,8 @@ void loop() {
   if (!wifi_manager::isConnected()) {
     const unsigned long now = millis();
     if (now - lastReconnectAttempt > kApRetryIntervalMs) {
-      wifi_manager::startAccessPoint(device_config::WIFI_SSID, device_config::WIFI_PASSWORD);
+      wifi_manager::startAccessPoint(device_config::WIFI_SSID,
+                                     device_config::WIFI_PASSWORD);
       lastReconnectAttempt = now;
     }
   }

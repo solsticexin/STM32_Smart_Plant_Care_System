@@ -1,659 +1,323 @@
-// 原理说明：Web 服务模块通过 ESP8266WebServer 提供静态资源与 REST 接口，并维护消息缓冲，实现网页与 STM32 间的 NDJSON 中转。
+// Web服务器模块实现
+// 负责提供静态文件服务和WebSocket通信，实现前端与STM32的实时数据交互
 #include "web_server_module.h"
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266WiFi.h>
 #include <FS.h>
 #include <LittleFS.h>
-#include <math.h>
+#include <WebSocketsServer.h>
 
-#include <vector>
-
+#include "protocol_parser.h"
 #include "serial_bridge.h"
 #include "wifi_manager.h"
 
 namespace web_server_module {
 namespace {
 
-struct SensorSnapshot {
-  bool valid = false;
-  float temp = 0.0f;
-  float humi = 0.0f;
-  int soil = 0;
-  float lux = 0.0f;
-  uint8_t water = 0;
-  uint8_t light = 0;
-  uint8_t fan = 0;
-  uint8_t buzzer = 0;
-  unsigned long updated_at = 0;
-};
-
-struct AckSnapshot {
-  bool valid = false;
-  String target;
-  String action;
-  String result;
-  unsigned long updated_at = 0;
-};
-
-struct NumericThreshold {
-  bool enabled = false;
-  float value = 0.0f;
-};
-
-struct ThresholdConfig {
-  NumericThreshold temp;
-  NumericThreshold humi;
-  NumericThreshold soil;
-  NumericThreshold lux;
-};
-
-struct AlarmState {
-  unsigned long lastTriggeredAt = 0;
-  String reason;
-  uint32_t count = 0;
-};
-
-struct MessageEntry {
-  uint32_t id = 0;
-  String payload;
-};
-
-ESP8266WebServer* server = nullptr;
+ESP8266WebServer *server = nullptr;
+WebSocketsServer *webSocket = nullptr;
 bool littleFsMounted = false;
-SensorSnapshot latest_sensor;
-AckSnapshot last_ack;
-ThresholdConfig threshold_config;
-AlarmState alarm_state;
-std::vector<MessageEntry> message_log;
-uint32_t last_message_id = 0;
-constexpr size_t kMaxMessages = 32;
-constexpr unsigned long kAlarmCooldownMs = 15000;
-constexpr uint16_t kAlarmPulseMs = 3000;
-unsigned long lastAlarmCommandMs = 0;
-String last_reported_ip("0.0.0.0");
 
-String buildFallbackPage() {
-  String html;
-  html.reserve(512);
-  html += F("<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"UTF-8\">");
-  html += F("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-  html += F("<title>ESP-01S 控制台</title>");
-  html += F("<style>body{font-family:Arial,sans-serif;margin:2rem;background:#f4f4f4;}");
-  html += F(".card{background:#fff;padding:1.5rem;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);max-width:420px;}");
-  html += F("h1{font-size:1.5rem;margin-bottom:1rem;}p{margin:0.25rem 0;font-size:0.95rem;}");
-  html += F("</style></head><body><div class=\"card\"><h1>ESP-01S 控制台</h1>");
-  html += F("<p><strong>热点状态:</strong> ");
-  html += wifi_manager::isConnected() ? F("已启用") : F("未启用");
-  html += F("</p><p><strong>IP 地址:</strong> ");
-  html += wifi_manager::localIP().toString();
-  html += F("</p><p><strong>运行时间:</strong> ");
-  html += String(millis() / 1000);
-  html += F(" 秒</p><p>LittleFS 未挂载，网页资源不可用，已回退到内置状态页。</p></div></body></html>");
-  return html;
-}
+// 设备状态结构体
+struct DeviceState {
+  float temperature = 0.0f;
+  float humidity = 0.0f;
+  uint16_t soilMoisture = 0;
+  uint16_t lightIntensity = 0;
+  bool fanState = false;
+  bool pumpState = false;
+  bool lightState = false;
+  bool buzzerState = false;
+  unsigned long lastUpdate = 0;
+};
 
-void addMessage(const String& line) {
-  MessageEntry entry;
-  entry.id = ++last_message_id;
-  entry.payload = line;
-  message_log.push_back(entry);
-  if (message_log.size() > kMaxMessages) {
-    message_log.erase(message_log.begin());
-  }
-}
+DeviceState currentState;
 
-bool anyThresholdEnabled() {
-  return threshold_config.temp.enabled || threshold_config.humi.enabled ||
-         threshold_config.soil.enabled || threshold_config.lux.enabled;
-}
-
-void appendExceedReason(String& reason, const __FlashStringHelper* label, float value, float limit, uint8_t decimals) {
-  if (reason.length() > 0) {
-    reason += F("；");
-  }
-  reason += label;
-  reason += ' ';
-  reason += String(value, decimals);
-  reason += F(" > 阈值 ");
-  reason += String(limit, decimals);
-}
-
-void fillThresholdJson(JsonObject object) {
-  auto assignThreshold = [&](const char* key, const NumericThreshold& threshold) {
-    if (threshold.enabled) {
-      object[key] = threshold.value;
-    } else {
-      object[key] = nullptr;
-    }
-  };
-
-  assignThreshold("temp", threshold_config.temp);
-  assignThreshold("humi", threshold_config.humi);
-  assignThreshold("soil", threshold_config.soil);
-  assignThreshold("lux", threshold_config.lux);
-}
-
-void fillAlarmJson(JsonObject object) {
-  object["count"] = alarm_state.count;
-  object["cooldownMs"] = kAlarmCooldownMs;
-  object["pulseMs"] = kAlarmPulseMs;
-  if (alarm_state.lastTriggeredAt != 0) {
-    object["reason"] = alarm_state.reason;
-    object["ageMs"] = millis() - alarm_state.lastTriggeredAt;
-  } else {
-    object["reason"] = nullptr;
-    object["ageMs"] = nullptr;
-  }
-}
-
-bool isNumericVariant(const JsonVariantConst& value) {
-  return value.is<int>() || value.is<long>() || value.is<unsigned int>() || value.is<unsigned long>() ||
-         value.is<float>() || value.is<double>();
-}
-
-bool updateThresholdValue(const char* key,
-                          NumericThreshold& target,
-                          const JsonVariantConst& value,
-                          float minValue,
-                          float maxValue,
-                          String& error) {
-  if (value.isNull()) {
-    target.enabled = false;
-    return true;
-  }
-
-  if (!isNumericVariant(value)) {
-    error = String(key) + F(" 必须为数值或 null");
-    return false;
-  }
-
-  const float numeric = value.as<float>();
-  if (isnan(numeric) || numeric < minValue || numeric > maxValue) {
-    error = String(key) + F(" 超出范围");
-    return false;
-  }
-
-  target.enabled = true;
-  target.value = numeric;
-  return true;
-}
-
-void checkAndTriggerAlarm(const JsonDocument& doc) {
-  if (!anyThresholdEnabled()) {
-    return;
-  }
-
-  bool triggered = false;
-  String reason;
-
-  if (threshold_config.temp.enabled) {
-    JsonVariantConst tempVar = doc["temp"];
-    if (!tempVar.isNull()) {
-      const float value = tempVar.as<float>();
-      if (!isnan(value) && value > threshold_config.temp.value) {
-        appendExceedReason(reason, F("温度"), value, threshold_config.temp.value, 1);
-        triggered = true;
-      }
-    }
-  }
-
-  if (threshold_config.humi.enabled) {
-    JsonVariantConst humiVar = doc["humi"];
-    if (!humiVar.isNull()) {
-      const float value = humiVar.as<float>();
-      if (!isnan(value) && value > threshold_config.humi.value) {
-        appendExceedReason(reason, F("湿度"), value, threshold_config.humi.value, 1);
-        triggered = true;
-      }
-    }
-  }
-
-  if (threshold_config.soil.enabled) {
-    JsonVariantConst soilVar = doc["soil"];
-    if (!soilVar.isNull()) {
-      const float value = soilVar.as<float>();
-      if (!isnan(value) && value > threshold_config.soil.value) {
-        appendExceedReason(reason, F("土壤"), value, threshold_config.soil.value, 0);
-        triggered = true;
-      }
-    }
-  }
-
-  if (threshold_config.lux.enabled) {
-    JsonVariantConst luxVar = doc["lux"];
-    if (!luxVar.isNull()) {
-      const float value = luxVar.as<float>();
-      if (!isnan(value) && value > threshold_config.lux.value) {
-        appendExceedReason(reason, F("光照"), value, threshold_config.lux.value, 1);
-        triggered = true;
-      }
-    }
-  }
-
-  if (!triggered) {
-    return;
-  }
-
-  const unsigned long now = millis();
-  alarm_state.reason = reason;
-  alarm_state.lastTriggeredAt = now;
-
-  if (now - lastAlarmCommandMs < kAlarmCooldownMs) {
-    return;
-  }
-
-  StaticJsonDocument<128> cmdDoc;
-  cmdDoc["type"] = "cmd";
-  cmdDoc["target"] = "buzzer";
-  cmdDoc["action"] = "pulse";
-  cmdDoc["time"] = kAlarmPulseMs;
-
-  String cmdLine;
-  serializeJson(cmdDoc, cmdLine);
-  if (!serial_bridge::sendJson(cmdDoc)) {
-    // Serial.println(F("自动报警命令发送失败"));
-    return;
-  }
-
-  addMessage(cmdLine);
-  const uint32_t commandMessageId = last_message_id;
-
-  StaticJsonDocument<192> logDoc;
-  logDoc["type"] = "alarm";
-  logDoc["reason"] = reason;
-  logDoc["triggeredAt"] = now;
-  logDoc["relatedMessageId"] = commandMessageId;
-  String logLine;
-  serializeJson(logDoc, logLine);
-  addMessage(logLine);
-
-  lastAlarmCommandMs = now;
-  alarm_state.count += 1;
-}
-
-void handleThresholdGet() {
-  if (!server) {
-    return;
-  }
-
+// 构建JSON字符串用于WebSocket发送
+String buildSensorDataJson() {
   StaticJsonDocument<256> doc;
-  doc["ok"] = true;
-  fillThresholdJson(doc.createNestedObject("thresholds"));
-  fillAlarmJson(doc.createNestedObject("alarm"));
+  doc["type"] = "sensorData";
+  doc["timestamp"] = millis();
+  doc["temperature"] = currentState.temperature;
+  doc["humidity"] = currentState.humidity;
+  doc["soilMoisture"] = currentState.soilMoisture;
+  doc["lightIntensity"] = currentState.lightIntensity;
 
-  String response;
-  serializeJson(doc, response);
-  server->sendHeader(F("Cache-Control"), F("no-store"));
-  server->send(200, "application/json", response);
+  String json;
+  serializeJson(doc, json);
+  return json;
 }
 
-void handleThresholdPost() {
-  if (!server) {
-    return;
-  }
-
-  if (!server->hasArg("plain")) {
-    server->send(400, "application/json", F("{\"error\":\"缺少 JSON 负载\"}"));
-    return;
-  }
-
-  const String body = server->arg("plain");
+String buildActuatorStateJson() {
   StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    server->send(400, "application/json", F("{\"error\":\"JSON 解析失败\"}"));
-    return;
-  }
+  doc["type"] = "actuatorState";
+  doc["timestamp"] = millis();
+  doc["fan"] = currentState.fanState;
+  doc["pump"] = currentState.pumpState;
+  doc["light"] = currentState.lightState;
+  doc["buzzer"] = currentState.buzzerState;
 
-  String error;
-  bool touched = false;
-
-  if (doc.containsKey("temp")) {
-    if (!updateThresholdValue("temp", threshold_config.temp, doc["temp"], -40.0f, 125.0f, error)) {
-      StaticJsonDocument<96> resp;
-      resp["error"] = error;
-      String serialized;
-      serializeJson(resp, serialized);
-      server->send(422, "application/json", serialized);
-      return;
-    }
-    touched = true;
-  }
-
-  if (doc.containsKey("humi")) {
-    if (!updateThresholdValue("humi", threshold_config.humi, doc["humi"], 0.0f, 100.0f, error)) {
-      StaticJsonDocument<96> resp;
-      resp["error"] = error;
-      String serialized;
-      serializeJson(resp, serialized);
-      server->send(422, "application/json", serialized);
-      return;
-    }
-    touched = true;
-  }
-
-  if (doc.containsKey("soil")) {
-    if (!updateThresholdValue("soil", threshold_config.soil, doc["soil"], 0.0f, 100.0f, error)) {
-      StaticJsonDocument<96> resp;
-      resp["error"] = error;
-      String serialized;
-      serializeJson(resp, serialized);
-      server->send(422, "application/json", serialized);
-      return;
-    }
-    touched = true;
-  }
-
-  if (doc.containsKey("lux")) {
-    if (!updateThresholdValue("lux", threshold_config.lux, doc["lux"], 0.0f, 200000.0f, error)) {
-      StaticJsonDocument<96> resp;
-      resp["error"] = error;
-      String serialized;
-      serializeJson(resp, serialized);
-      server->send(422, "application/json", serialized);
-      return;
-    }
-    touched = true;
-  }
-
-  if (!touched) {
-    server->send(422, "application/json", F("{\"error\":\"缺少阈值字段\"}"));
-    return;
-  }
-
-  StaticJsonDocument<256> resp;
-  resp["ok"] = true;
-  fillThresholdJson(resp.createNestedObject("thresholds"));
-  fillAlarmJson(resp.createNestedObject("alarm"));
-  String serialized;
-  serializeJson(resp, serialized);
-  server->send(200, "application/json", serialized);
+  String json;
+  serializeJson(doc, json);
+  return json;
 }
 
-void handleFallbackRoot() {
-  if (!server) {
-    return;
+// WebSocket事件处理
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
+                      size_t length) {
+  switch (type) {
+  case WStype_DISCONNECTED:
+    // 客户端断开连接
+    break;
+  case WStype_CONNECTED: {
+    // 客户端连接，发送当前状态
+    String sensorJson = buildSensorDataJson();
+    String actuatorJson = buildActuatorStateJson();
+    webSocket->sendTXT(num, sensorJson);
+    webSocket->sendTXT(num, actuatorJson);
+  } break;
+  case WStype_TEXT: {
+    // 处理来自客户端的控制命令
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+    if (error) {
+      return;
+    }
+
+    String commandType = doc["type"];
+    if (commandType == "control") {
+      String target = doc["target"];
+      String action = doc["action"];
+
+      ActuatorTag tag;
+      if (target == "fan")
+        tag = ActuatorTag::FAN;
+      else if (target == "pump")
+        tag = ActuatorTag::PUMP;
+      else if (target == "light")
+        tag = ActuatorTag::LIGHT;
+      else if (target == "buzzer")
+        tag = ActuatorTag::BUZZER;
+      else
+        return;
+
+      if (action == "on" || action == "off") {
+        // 开关控制命令
+        ActuatorState state =
+            (action == "on") ? ActuatorState::ON : ActuatorState::OFF;
+        serial_bridge::sendCommand(tag, state);
+      } else if (action == "pulse") {
+        // 脉冲控制命令
+        int duration = doc["duration"];
+        if (duration > 0 && duration <= 10000) {
+          serial_bridge::sendPulseCommand(tag, duration);
+        }
+      }
+    }
+  } break;
+  default:
+    break;
   }
-  server->send(200, "text/html", buildFallbackPage());
 }
 
-void handleIndexHtml() {
-  if (!server) {
-    return;
+// 广播消息给所有WebSocket客户端
+void broadcastMessage(String message) {
+  if (webSocket != nullptr) {
+    webSocket->broadcastTXT(message);
+  }
+}
+
+// 处理传感器数据帧
+void handleSensorReportFrame(ProtocolFrame *frame) {
+  for (const auto &tlv : frame->payload) {
+    switch (static_cast<SensorTag>(tlv.tag)) {
+    case SensorTag::TEMPERATURE:
+      if (tlv.len == 2) {
+        uint16_t rawValue = (tlv.value[0] << 8) | tlv.value[1];
+        currentState.temperature = rawValue / 100.0f;
+      }
+      break;
+    case SensorTag::HUMIDITY:
+      if (tlv.len == 2) {
+        uint16_t rawValue = (tlv.value[0] << 8) | tlv.value[1];
+        currentState.humidity = rawValue / 100.0f;
+      }
+      break;
+    case SensorTag::SOIL_MOISTURE:
+      if (tlv.len == 2) {
+        currentState.soilMoisture = (tlv.value[0] << 8) | tlv.value[1];
+      }
+      break;
+    case SensorTag::LIGHT_INTENSITY:
+      if (tlv.len == 2) {
+        currentState.lightIntensity = (tlv.value[0] << 8) | tlv.value[1];
+      }
+      break;
+    default:
+      break;
+    }
   }
 
+  currentState.lastUpdate = millis();
+  // 广播传感器数据更新
+  broadcastMessage(buildSensorDataJson());
+}
+
+// 处理执行器状态帧
+void handleActuatorStatusFrame(ProtocolFrame *frame) {
+  for (const auto &tlv : frame->payload) {
+    if (tlv.len != 1)
+      continue;
+
+    bool state = (tlv.value[0] == 0x01);
+
+    switch (static_cast<ActuatorTag>(tlv.tag)) {
+    case ActuatorTag::FAN:
+      currentState.fanState = state;
+      break;
+    case ActuatorTag::PUMP:
+      currentState.pumpState = state;
+      break;
+    case ActuatorTag::LIGHT:
+      currentState.lightState = state;
+      break;
+    case ActuatorTag::BUZZER:
+      currentState.buzzerState = state;
+      break;
+    default:
+      break;
+    }
+  }
+
+  // 广播执行器状态更新
+  broadcastMessage(buildActuatorStateJson());
+}
+
+// 处理命令确认帧
+void handleCommandAckFrame(ProtocolFrame *frame) {
+  // 命令确认帧，不需要特殊处理
+  // 前端会通过执行器状态更新来获知命令执行结果
+}
+
+// 静态文件处理函数
+void handleStaticFile(const String &path, const String &contentType) {
   if (!littleFsMounted) {
-    handleFallbackRoot();
+    server->send(500, "text/plain", "File system not mounted");
     return;
   }
 
-  File file = LittleFS.open("/index.html", "r");
+  File file = LittleFS.open(path, "r");
   if (!file) {
-    server->send(500, "text/plain", "index.html not found");
+    server->send(404, "text/plain", "File not found");
     return;
   }
 
-  server->streamFile(file, F("text/html"));
+  server->streamFile(file, contentType);
   file.close();
 }
 
-void handleMessagesRequest() {
-  if (!server) {
-    return;
-  }
+// 根路径处理
+void handleRoot() { handleStaticFile("/smart-plant-care.html", "text/html"); }
 
-  uint32_t after = 0;
-  if (server->hasArg("after")) {
-    after = static_cast<uint32_t>(server->arg("after").toInt());
-  }
+// CSS文件处理
+void handleStyles() { handleStaticFile("/styles.css", "text/css"); }
 
-  String body;
-  for (const auto& message : message_log) {
-    if (message.id > after) {
-      body += message.payload;
-      body += '\n';
-    }
-  }
-
-  server->sendHeader(F("Cache-Control"), F("no-store"));
-  server->sendHeader(F("X-Last-Message-Id"), String(last_message_id));
-  server->send(200, "application/x-ndjson", body);
+// JavaScript文件处理
+void handleScript(const String &scriptName) {
+  String path = "/" + scriptName + ".js";
+  handleStaticFile(path, "application/javascript");
 }
 
-void handleStateRequest() {
-  if (!server) {
-    return;
-  }
+// 404处理
+void handleNotFound() { server->send(404, "text/plain", "Not found"); }
 
-  StaticJsonDocument<384> doc;
-  JsonObject wifi = doc.createNestedObject("wifi");
-  wifi["connected"] = wifi_manager::isConnected();
-  wifi["ip"] = wifi_manager::localIP().toString();
-
-  doc["stm32ReportedIp"] = last_reported_ip;
-  doc["uptimeSeconds"] = millis() / 1000;
-
-  if (latest_sensor.valid) {
-    JsonObject data = doc.createNestedObject("latestData");
-    data["temp"] = latest_sensor.temp;
-    data["humi"] = latest_sensor.humi;
-    data["soil"] = latest_sensor.soil;
-    data["lux"] = latest_sensor.lux;
-    data["water"] = latest_sensor.water;
-    data["light"] = latest_sensor.light;
-    data["fan"] = latest_sensor.fan;
-    data["buzzer"] = latest_sensor.buzzer;
-    data["ageMs"] = millis() - latest_sensor.updated_at;
-  }
-
-  if (last_ack.valid) {
-    JsonObject ack = doc.createNestedObject("latestAck");
-    ack["target"] = last_ack.target;
-    ack["action"] = last_ack.action;
-    ack["result"] = last_ack.result;
-    ack["ageMs"] = millis() - last_ack.updated_at;
-  }
-
-  fillThresholdJson(doc.createNestedObject("thresholds"));
-  fillAlarmJson(doc.createNestedObject("alarm"));
-
-  String response;
-  serializeJson(doc, response);
-  server->sendHeader(F("Cache-Control"), F("no-store"));
-  server->send(200, "application/json", response);
-}
-
-bool validateCommand(JsonDocument& doc, String& error) {
-  const char* target = doc["target"];
-  const char* action = doc["action"];
-
-  if (target == nullptr || action == nullptr) {
-    error = F("缺少 target 或 action 字段");
-    return false;
-  }
-
-  if (strcmp(target, "water") != 0 && strcmp(target, "light") != 0 && strcmp(target, "fan") != 0 &&
-      strcmp(target, "buzzer") != 0) {
-    error = F("target 非法");
-    return false;
-  }
-
-  if (strcmp(action, "on") != 0 && strcmp(action, "off") != 0 && strcmp(action, "pulse") != 0) {
-    error = F("action 非法");
-    return false;
-  }
-
-  if (strcmp(action, "pulse") == 0) {
-    if (!doc.containsKey("time")) {
-      error = F("pulse 指令缺少 time");
-      return false;
-    }
-    const int pulse_ms = doc["time"];
-    if (pulse_ms <= 0 || pulse_ms > 10000) {
-      error = F("time 超出范围");
-      return false;
-    }
-  }
-
-  return true;
-}
-
-void handleCommandRequest() {
-  if (!server) {
-    return;
-  }
-
-  if (!server->hasArg("plain")) {
-    server->send(400, "application/json", F("{\"error\":\"缺少 JSON 负载\"}"));
-    return;
-  }
-
-  const String body = server->arg("plain");
-  StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    server->send(400, "application/json", F("{\"error\":\"JSON 解析失败\"}"));
-    return;
-  }
-
-  doc["type"] = "cmd";
-
-  String error;
-  if (!validateCommand(doc, error)) {
-    StaticJsonDocument<96> resp;
-    resp["error"] = error;
-    String serialized;
-    serializeJson(resp, serialized);
-    server->send(422, "application/json", serialized);
-    return;
-  }
-
-  if (!serial_bridge::sendJson(doc)) {
-    server->send(500, "application/json", F("{\"error\":\"串口发送失败\"}"));
-    return;
-  }
-
-  String serialized;
-  serializeJson(doc, serialized);
-  addMessage(serialized);
-
-  StaticJsonDocument<96> resp;
-  resp["result"] = "sent";
-  resp["queuedId"] = last_message_id;
-  String response;
-  serializeJson(resp, response);
-  server->send(200, "application/json", response);
-}
-
-void handleNotFound() {
-  if (!server) {
-    return;
-  }
-
-  if (!littleFsMounted && server->uri() == "/") {
-    handleFallbackRoot();
-    return;
-  }
-
-  server->send(404, "text/plain", "Not found");
-}
-
-void updateSensorSnapshot(const JsonDocument& doc) {
-  latest_sensor.valid = true;
-  latest_sensor.temp = doc["temp"] | latest_sensor.temp;
-  latest_sensor.humi = doc["humi"] | latest_sensor.humi;
-  latest_sensor.soil = doc["soil"] | latest_sensor.soil;
-  latest_sensor.lux = doc["lux"] | latest_sensor.lux;
-  latest_sensor.water = doc["water"] | latest_sensor.water;
-  latest_sensor.light = doc["light"] | latest_sensor.light;
-  latest_sensor.fan = doc["fan"] | latest_sensor.fan;
-  latest_sensor.buzzer = doc["buzzer"] | latest_sensor.buzzer;
-  latest_sensor.updated_at = millis();
-}
-
-void updateAckSnapshot(const JsonDocument& doc) {
-  last_ack.valid = true;
-  last_ack.target = doc["target"] | "";
-  last_ack.action = doc["action"] | "";
-  last_ack.result = doc["result"] | "";
-  last_ack.updated_at = millis();
-}
-
-}  // namespace
+} // namespace
 
 void start(uint16_t port) {
+  // 初始化文件系统
+  if (littleFsMounted) {
+    LittleFS.end();
+    littleFsMounted = false;
+  }
+  littleFsMounted = LittleFS.begin();
+  if (!littleFsMounted) {
+    // Serial.println("LittleFS mount failed");
+  }
+
+  // 初始化Web服务器
   if (server != nullptr) {
     server->stop();
     delete server;
     server = nullptr;
   }
-
-  if (littleFsMounted) {
-    LittleFS.end();
-    littleFsMounted = false;
-  }
-
-  littleFsMounted = LittleFS.begin();
-  if (!littleFsMounted) {
-    // Serial.println(F("LittleFS 挂载失败，将使用回退页面。"));
-  }
-
   server = new ESP8266WebServer(port);
 
-  if (littleFsMounted) {
-    server->on("/", handleIndexHtml);
-    server->serveStatic("/index.css", LittleFS, "/index.css");
-    server->serveStatic("/index.js", LittleFS, "/index.js");
-  } else {
-    server->on("/", handleFallbackRoot);
+  // 初始化WebSocket服务器
+  if (webSocket != nullptr) {
+    delete webSocket;
+    webSocket = nullptr;
   }
+  webSocket = new WebSocketsServer(81);
+  webSocket->begin();
+  webSocket->onEvent(onWebSocketEvent);
 
-  server->on("/api/messages", HTTP_GET, handleMessagesRequest);
-  server->on("/api/state", HTTP_GET, handleStateRequest);
-  server->on("/api/cmd", HTTP_POST, handleCommandRequest);
-  server->on("/api/thresholds", HTTP_GET, handleThresholdGet);
-  server->on("/api/thresholds", HTTP_POST, handleThresholdPost);
+  // 注册路由
+  server->on("/", handleRoot);
+  server->on("/styles.css", handleStyles);
+  server->on("/app.js", []() { handleScript("app"); });
+  server->on("/protocol-parser.js", []() { handleScript("protocol-parser"); });
+  server->on("/state-manager.js", []() { handleScript("state-manager"); });
+  server->on("/communication-manager.js",
+             []() { handleScript("communication-manager"); });
+  server->on("/ui-updater.js", []() { handleScript("ui-updater"); });
+  server->on("/utils.js", []() { handleScript("utils"); });
   server->onNotFound(handleNotFound);
+
+  // 启动Web服务器
   server->begin();
+
+  // 设置串口帧处理回调
+  serial_bridge::setFrameHandler([](ProtocolFrame *frame) {
+    if (frame == nullptr)
+      return;
+
+    switch (frame->type) {
+    case MessageType::SENSOR_REPORT:
+      handleSensorReportFrame(frame);
+      break;
+    case MessageType::ACTUATOR_STATUS:
+      handleActuatorStatusFrame(frame);
+      break;
+    case MessageType::COMMAND_ACK:
+      handleCommandAckFrame(frame);
+      break;
+    default:
+      break;
+    }
+  });
 }
 
 void loop() {
+  // 处理Web服务器请求
   if (server != nullptr) {
     server->handleClient();
   }
-}
 
-bool isRunning() {
-  return server != nullptr;
-}
-
-void handleSerialLine(const String& line) {
-  addMessage(line);
-
-  StaticJsonDocument<256> doc;
-  const DeserializationError err = deserializeJson(doc, line);
-  if (err) {
-    // Serial.print(F("解析串口 JSON 失败: "));
-    // Serial.println(err.c_str());
-    return;
-  }
-
-  const char* type = doc["type"];
-  if (type == nullptr) {
-    // Serial.println(F("串口消息缺少 type 字段"));
-    return;
-  }
-
-  if (strcmp(type, "data") == 0) {
-    updateSensorSnapshot(doc);
-    checkAndTriggerAlarm(doc);
-  } else if (strcmp(type, "ack") == 0) {
-    updateAckSnapshot(doc);
-  } else if (strcmp(type, "status") == 0) {
-    last_reported_ip = doc["ip"] | last_reported_ip;
+  // 处理WebSocket事件
+  if (webSocket != nullptr) {
+    webSocket->loop();
   }
 }
 
-}  // namespace web_server_module
+bool isRunning() { return server != nullptr; }
+
+// 处理串口消息的函数（被serial_bridge调用）
+void handleSerialLine(const String &line) {
+  // 这个函数在新的实现中不再使用，因为我们直接通过setFrameHandler处理帧
+  // 保留这个函数是为了保持接口兼容性
+}
+
+} // namespace web_server_module
